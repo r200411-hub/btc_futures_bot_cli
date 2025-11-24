@@ -58,3 +58,17 @@ class DeltaExchangeWebSocket:
                 self.cb(float(data["mark_price"]),data)
         except:
             pass
+    def reconnect(self):
+        print("🔄 Reconnecting WebSocket...")
+
+        try:
+            if hasattr(self, "ws") and self.ws:
+                self.ws.close()
+        except:
+            pass
+
+        time.sleep(1)
+        self.connect()
+
+
+    
