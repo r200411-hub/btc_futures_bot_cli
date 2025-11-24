@@ -4,13 +4,15 @@ import os
 from datetime import datetime
 
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+import os
+
 class ParquetLogger:
 
     def __init__(self, filename="trades.parquet"):
-
         self.filename = filename
 
-        # schema definition (fixed)
         self.schema = pa.schema([
             ("timestamp", pa.string()),
             ("side", pa.string()),
@@ -20,30 +22,42 @@ class ParquetLogger:
             ("brick_size", pa.float64()),
         ])
 
-        # Create empty file if doesn't exist
-        if not os.path.exists(filename):
-            empty = pa.Table.from_pydict({}, schema=self.schema)
-            pq.write_table(empty, filename)
+        if not os.path.exists(self.filename):
+
+            empty_table = pa.Table.from_arrays(
+                [
+                    pa.array([], type=pa.string()),
+                    pa.array([], type=pa.string()),
+                    pa.array([], type=pa.string()),
+                    pa.array([], type=pa.float64()),
+                    pa.array([], type=pa.float64()),
+                    pa.array([], type=pa.float64()),
+                ],
+                schema=self.schema,
+            )
+
+            pq.write_table(empty_table, self.filename)
 
 
-    def log(self, trade_record: tuple):
 
-        # trade_record expected format:
-        # (timestamp, side, action, price, pnl, brick_size)
+    def log(self, record):
 
-        record_dict = {
-            "timestamp":   [trade_record[0]],
-            "side":        [trade_record[1]],
-            "action":      [trade_record[2]],
-            "price":       [float(trade_record[3])],
-            "pnl":         [float(trade_record[4])],
-            "brick_size":  [float(trade_record[5])],
+        row = {
+            "timestamp":   [record[0]],
+            "side":        [record[1]],
+            "action":      [record[2]],
+            "price":       [float(record[3])],
+            "pnl":         [float(record[4])],
+            "brick_size":  [float(record[5])],
         }
 
-        table = pa.Table.from_pydict(record_dict, schema=self.schema)
+        table = pa.Table.from_pydict(row, schema=self.schema)
 
-        # append to file
-        with pq.ParquetWriter(self.filename, self.schema, use_dictionary=True, compression="snappy") as writer:
-            writer.write_table(table)
+        # APPEND CORRECTLY
+        existing = pq.read_table(self.filename)
+        combined = pa.concat_tables([existing, table])
 
-        print("💾 Parquet trade saved")
+        pq.write_table(combined, self.filename)
+
+        print("💾 stored in Parquet")
+
