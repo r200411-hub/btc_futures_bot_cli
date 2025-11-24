@@ -28,8 +28,7 @@ tick_filter = BadTickFilter(
     log_callback=lambda reason, price, pct=None: print(f"⚠ BAD TICK: {reason} {price} Δ={pct}")
 )
 
-hang = SilentHangGuard(timeout=25,on_hang=lambda: ws.reconnect())
-hang.start()
+
 
 
 slow = SlowdownDetector(
@@ -113,8 +112,8 @@ ws = DeltaExchangeWebSocket(
     settings["api_secret"],
     on_price
 )
-
-hang = SilentHangGuard(timeout=25, on_hang=lambda: ws.reconnect())
+ 
+hang = SilentHangGuard(timeout=10, on_hang=lambda: ws.reconnect())
 hang.start()
 
 ws.hang = hang     # ← important placement BEFORE connect()

@@ -36,7 +36,7 @@ class DeltaExchangeWebSocket:
 
         # run in thread
         threading.Thread(
-            target=lambda: self.ws.run_forever(ping_interval=10, ping_timeout=5),
+            target=lambda: self.ws.run_forever(ping_interval=10, ping_timeout=3),
             daemon=True
         ).start()
 
