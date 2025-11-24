@@ -2,7 +2,7 @@ import websocket
 import json
 import hmac, hashlib, time, threading
 from core.hang_guard import SilentHangGuard
-
+from core.adaptive_reconnect import AdaptiveReconnect
 
 class DeltaExchangeWebSocket:
 
@@ -11,9 +11,14 @@ class DeltaExchangeWebSocket:
         self.secret = secret
         self.cb = callback
         self.ws = None
-        self.active = False
-        self.hang = None
 
+        self.active = False
+        self.hang = None  # SilentHangGuard (injected later)
+        self.reconnect_lock = threading.Lock() 
+
+        self.last_reconnect = 0
+        self.reconnect_attempts = 0
+        self.reconnector = AdaptiveReconnect()  # uptime tracker module (optional)
 
     def connect(self):
 
@@ -24,6 +29,7 @@ class DeltaExchangeWebSocket:
         print("⏳ Connecting to Delta WebSocket…")
 
         self.active = True
+        self._authed = False
 
         self.ws = websocket.WebSocketApp(
             "wss://socket.india.delta.exchange",
@@ -42,6 +48,8 @@ class DeltaExchangeWebSocket:
 
 
     def _on_open(self, ws):
+        self.reconnector.on_connect()
+        self.reconnect_attempts = 0
         print("🟢 WebSocket OPENED")
 
         ts = str(int(time.time()))
@@ -98,6 +106,8 @@ class DeltaExchangeWebSocket:
     def _on_close(self, ws, *args):
         print("🔴 WS CLOSED")
         self.active = False
+        avg_up = self.reconnector.on_disconnect()
+        print(f"🔻 Avg uptime: {avg_up:.1f}s (quality={self.reconnector.get_quality_score()})")
 
     def _on_error(self, ws, err):
         print("❌ WS ERROR:", err)
@@ -105,15 +115,47 @@ class DeltaExchangeWebSocket:
 
 
     def reconnect(self):
-        print("🔄 RECONNECTING WS…")
 
-        try:
-            if self.ws:
-                self.ws.close()
-        except:
-            pass
+        with self.reconnect_lock:
 
-        self.active = False
+            now = time.time()
+            if now - self.last_reconnect < 3:
+                print("⚠ reconnect suppressed")
+                return
+            
+            self.last_reconnect = now
+            self.reconnect_attempts += 1
 
-        time.sleep(1)
-        self.connect()
+
+            # 1) base adaptive delay
+            q = self.reconnector.get_quality_score()
+            if q == "excellent":
+                delay = 2
+            elif q == "good":
+                delay = 5
+            elif q == "poor":
+                delay = 12
+            else:
+                delay = 30
+
+            # 2) exponential backoff penalty
+            penalty = min(2 ** self.reconnect_attempts, 30)
+
+            delay += penalty
+
+            print(f"🔄 RECONNECTING WS… delay {delay}s (attempt={self.reconnect_attempts}, quality={q})")
+
+
+            try:
+                if self.ws:
+                    self.ws.close()
+            except:
+                pass
+
+            self.active = False
+
+            time.sleep(delay)
+            self.connect()
+
+
+

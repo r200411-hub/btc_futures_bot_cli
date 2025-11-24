@@ -3,61 +3,49 @@ import pyarrow.parquet as pq
 import os
 from datetime import datetime
 
-
-import pyarrow as pa
-import pyarrow.parquet as pq
-import os
-
 class ParquetLogger:
 
-    def __init__(self, filename="trades.parquet"):
-        self.filename = filename
+    def __init__(self, path="data/tickdata.parquet"):
+
+        self.path = path
 
         self.schema = pa.schema([
             ("timestamp", pa.string()),
-            ("side", pa.string()),
-            ("action", pa.string()),
             ("price", pa.float64()),
-            ("pnl", pa.float64()),
-            ("brick_size", pa.float64()),
+            ("fast_ema", pa.float64()),
+            ("slow_ema", pa.float64()),
+            ("fast_period", pa.int32()),
+            ("slow_period", pa.int32()),
+            ("ema_spread", pa.float64()),
+            ("vol_ema", pa.float64()),
+            ("regime", pa.string()),
+            ("regime_confidence", pa.float64()),
+            ("brick_dir", pa.string()),
+            ("brick_count", pa.int32()),
+            ("signal", pa.string()),
+            ("pos_side", pa.string()),
+            ("pnl", pa.float64())
         ])
 
-        if not os.path.exists(self.filename):
+        self.batch = []
 
-            empty_table = pa.Table.from_arrays(
-                [
-                    pa.array([], type=pa.string()),
-                    pa.array([], type=pa.string()),
-                    pa.array([], type=pa.string()),
-                    pa.array([], type=pa.float64()),
-                    pa.array([], type=pa.float64()),
-                    pa.array([], type=pa.float64()),
-                ],
-                schema=self.schema,
-            )
+    def log(self, row: dict):
 
-            pq.write_table(empty_table, self.filename)
+        self.batch.append(row)
 
+        if len(self.batch) >= 200:
+            self.flush()
 
+    def flush(self):
 
-    def log(self, record):
+        if not self.batch:
+            return
+        
+        table = pa.Table.from_pylist(self.batch, schema=self.schema)
 
-        row = {
-            "timestamp":   [record[0]],
-            "side":        [record[1]],
-            "action":      [record[2]],
-            "price":       [float(record[3])],
-            "pnl":         [float(record[4])],
-            "brick_size":  [float(record[5])],
-        }
+        if os.path.exists(self.path):
+            pq.write_table(table, self.path, append=True)
+        else:
+            pq.write_table(table, self.path)
 
-        table = pa.Table.from_pydict(row, schema=self.schema)
-
-        # APPEND CORRECTLY
-        existing = pq.read_table(self.filename)
-        combined = pa.concat_tables([existing, table])
-
-        pq.write_table(combined, self.filename)
-
-        print("💾 stored in Parquet")
-
+        self.batch = []

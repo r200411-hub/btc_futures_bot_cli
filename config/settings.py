@@ -12,4 +12,11 @@ settings = {
 
     "take_profit": 100,
     "stop_loss": -50,
+    # dynamic EMA tuning (rough)
+    "vol_low": 10.0,    # calm regime ~ small |Δprice|
+    "vol_high": 60.0,   # very wild regime
+    "fast_min": 4,
+    "fast_max": 20,
+    "slow_min": 10,
+    "slow_max": 50,
 }
