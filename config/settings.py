@@ -7,8 +7,8 @@ settings = {
     "slow_ema": 21,
 
     "min_trade_gap": 60,      # seconds
-    "position_size": 0.005,
-    "leverage": 10,
+    "position_size": 0.001,
+    "leverage": 50,
 
     "take_profit": 100,
     "stop_loss": -50,

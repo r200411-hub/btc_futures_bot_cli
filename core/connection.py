@@ -1,6 +1,8 @@
 import websocket
 import json
-import hmac, hashlib, time
+import hmac, hashlib, time, threading
+from core.hang_guard import SilentHangGuard
+
 
 class DeltaExchangeWebSocket:
 
@@ -9,16 +11,35 @@ class DeltaExchangeWebSocket:
         self.secret = secret
         self.cb = callback
         self.ws = None
+        self.active = False
+        self.hang = None
+
 
     def connect(self):
+
+        if self.active:
+            print("⚠️ WS already running, skipping connect")
+            return
+
         print("⏳ Connecting to Delta WebSocket…")
+
+        self.active = True
+
         self.ws = websocket.WebSocketApp(
             "wss://socket.india.delta.exchange",
             on_message=self._on_message,
-            on_open=self._on_open
+            on_open=self._on_open,
+            on_close=self._on_close,
+            on_error=self._on_error
         )
+        
 
-        self.ws.run_forever()
+        # run in thread
+        threading.Thread(
+            target=lambda: self.ws.run_forever(ping_interval=10, ping_timeout=5),
+            daemon=True
+        ).start()
+
 
     def _on_open(self, ws):
         print("🟢 WebSocket OPENED")
@@ -45,30 +66,54 @@ class DeltaExchangeWebSocket:
 
 
     def _on_message(self, ws, message):
+        if self.hang:
+           self.hang.mark()
+
+
         try:
             data = json.loads(message)
-           # print("RAW:", message)
-            if data.get("type") == "success":
-               print("AUTH SUCCESS")
-            if data.get("type") == "subscriptions":
-               print("MARKET DATA CHANNELS ACTIVE")
+            if (data.get("type") == "success") or (data.get("message") == "Authenticated"):
+                if not getattr(self, "_authed", False):
+                    print("AUTH SUCCESS")
+                    self._authed = True
+
+            # if data.get("type") == "success":
+            #     print("AUTH SUCCESS")
+
+            # elif data.get("message") == "Authenticated":
+            #     print("AUTH SUCCESS")
 
 
-            if "mark_price" in data:
-                self.cb(float(data["mark_price"]),data)
+            elif data.get("type") == "subscriptions":
+                print("MARKET DATA CHANNELS ACTIVE")
+
+            elif "mark_price" in data:
+                price = float(data["mark_price"])
+                self.cb(price, data)
+
         except:
             pass
+
+
+    def _on_close(self, ws, *args):
+        print("🔴 WS CLOSED")
+        self.active = False
+
+    def _on_error(self, ws, err):
+        print("❌ WS ERROR:", err)
+        self.active = False
+
+
     def reconnect(self):
-        print("🔄 Reconnecting WebSocket...")
+        print("🔄 RECONNECTING WS…")
 
         try:
-            if hasattr(self, "ws") and self.ws:
+            if self.ws:
                 self.ws.close()
         except:
             pass
 
+        self.active = False
+
         time.sleep(1)
         self.connect()
-
-
-    

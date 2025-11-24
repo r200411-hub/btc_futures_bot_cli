@@ -7,6 +7,10 @@ from core.heartbeat import HeartbeatMonitor
 from core.freeze_detector import FreezeDetector
 from core.validator import AccuracyValidator
 from config.settings import settings
+from core.hang_guard import SilentHangGuard
+from core.slowdown import SlowdownDetector
+from core.risk_guard import RiskGuard
+import websocket
 
 import sys, time, os
 
@@ -24,13 +28,33 @@ tick_filter = BadTickFilter(
     log_callback=lambda reason, price, pct=None: print(f"⚠ BAD TICK: {reason} {price} Δ={pct}")
 )
 
+hang = SilentHangGuard(timeout=25,on_hang=lambda: ws.reconnect())
+hang.start()
+
+
+slow = SlowdownDetector(
+    window=40,
+    threshold_factor=3.0,
+    on_slow=lambda: ws.reconnect()
+)
+
+slow.start()
+
+risk = RiskGuard(
+    max_exposure_seconds=180,
+    max_distance_pct=0.4,
+    on_risk=lambda reason: trader.close(strategy.last_price, reason)
+)
+
 
 ### CALLBACK ###
 
 def on_price(price, raw=None):
-
+    
+    slow.mark()
     freeze.tick()
     hb.beat()
+    
 
     if not tick_filter.validate(price):
         return
@@ -43,6 +67,7 @@ def on_price(price, raw=None):
     if sig and trader.can_trade() and not trader.position:
         print(f"\n🟢 SIGNAL: {sig} @ {price}")
         trader.open(sig, price)
+        risk.on_open(sig, price)
 
     if trader.position:
 
@@ -55,6 +80,7 @@ def on_price(price, raw=None):
 
             trader.close(price, "SL/TP")
             logger.log(price, strategy, trader, sig)
+            risk.reset()
 
             validator.evaluate(side, entry, price)
             print(f"📊 ACCURACY = {validator.accuracy()}%")
@@ -80,8 +106,19 @@ freeze.start()
 
 
 ### RUN ###
-
 os.system("")
+
+ws = DeltaExchangeWebSocket(
+    settings["api_key"],
+    settings["api_secret"],
+    on_price
+)
+
+hang = SilentHangGuard(timeout=25, on_hang=lambda: ws.reconnect())
+hang.start()
+
+ws.hang = hang     # ← important placement BEFORE connect()
+
 ws.connect()
 
 print("Websocket started… press CTRL+C to stop")
@@ -92,3 +129,4 @@ try:
 
 except KeyboardInterrupt:
     print("\n👋 Exit requested")
+
