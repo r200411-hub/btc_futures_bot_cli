@@ -66,7 +66,11 @@ def close_position_by_executor(price: float):
     if not getattr(trader, "position", None):
         print("⚪ No open position to close.")
         return
-    cur_side = trader.position.get("type")
+    # Correct: read actual side
+    cur_side = trader.position.get("side") or trader.position.get("type")
+    if not cur_side:
+        print("⚠ trader.position has no side/type key!")
+        return
     opposite = "SHORT" if cur_side == "LONG" else "LONG"
     place_order(opposite, price, size=trader.position.get("size", settings.get("position_size")))
 
@@ -211,7 +215,7 @@ def on_price(price, raw=None):
             "brick_dir": strategy.bricks[-1]["dir"] if strategy.bricks else None,
             "brick_count": len(strategy.bricks),
             "signal": sig,
-            "pos_side": trader.position["type"] if trader.position else None,
+            "pos_side": trader.position.get("side") if trader.position else None,
             "pnl": trader.calculate_pnl(price) if getattr(trader, "position", None) else 0.0
         })
     except Exception as e:

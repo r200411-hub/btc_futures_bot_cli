@@ -40,3 +40,5 @@ class TradeManager:
         self.position = None
 
         return pnl
+    
+    
