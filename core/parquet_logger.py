@@ -2,13 +2,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import os
 from datetime import datetime
-
+from datetime import datetime,timezone
 class ParquetLogger:
 
-    def __init__(self, path="data/tickdata.parquet"):
+    def __init__(self, path):
 
         self.path = path
-
+        print(path)
         self.schema = pa.schema([
             ("timestamp", pa.string()),
             ("price", pa.float64()),
@@ -26,26 +26,46 @@ class ParquetLogger:
             ("pos_side", pa.string()),
             ("pnl", pa.float64())
         ])
-
+        
         self.batch = []
 
     def log(self, row: dict):
-
         self.batch.append(row)
-
+        #print(len(self.batch)) 
         if len(self.batch) >= 200:
-            self.flush()
+           self.flush()
+
+    
 
     def flush(self):
-
         if not self.batch:
             return
-        
+       
         table = pa.Table.from_pylist(self.batch, schema=self.schema)
-
+        
         if os.path.exists(self.path):
-            pq.write_table(table, self.path, append=True)
-        else:
-            pq.write_table(table, self.path)
 
+            # load existing table
+            old = pq.read_table(self.path)
+
+            # append to previous data
+            combined = pa.concat_tables([old, table])
+
+            pq.write_table(combined, self.path)
+
+        else:
+            # create new file
+            pq.write_table(table, self.path)
+            
         self.batch = []
+
+    def close(self):
+        """
+        Force write before shutdown.
+        """
+        try:
+           self.flush()
+        except:
+            pass
+
+        

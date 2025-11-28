@@ -8,9 +8,9 @@ class MLLogger:
     def __init__(self, path):
 
         self.path = path
-
+        print(path)
         exists = os.path.exists(path)
-
+        
         # open in append, newline flush enabled
         self.f = open(path, "a", newline="", buffering=1)
         self.w = csv.writer(self.f)
@@ -53,7 +53,7 @@ class MLLogger:
                 # pnl
                 "pnl"
             ])
-
+    
     def log(self, price, strategy, trader, regime, signal):
         
         

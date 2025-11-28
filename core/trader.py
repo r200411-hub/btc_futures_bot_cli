@@ -5,7 +5,7 @@ from core.parquet_logger import ParquetLogger
 class TradeManager:
 
     def __init__(self, cfg):
-        self.pq = ParquetLogger()
+        #self.pq = ParquetLogger()
         self.cfg = cfg
         self.position = None
         self.trades = []
@@ -30,7 +30,8 @@ class TradeManager:
         pnl = (price-entry) * (1 if side=="LONG" else -1)
 
         self.total += pnl
-        self.pq.log(record)
+       
+       # self.pq.log(record)
 
         print(
             f"📉 CLOSE {side} @ {price} PnL={pnl:.2f} TOTAL={self.total:.2f} ({reason})"
