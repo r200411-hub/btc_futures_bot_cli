@@ -191,52 +191,69 @@ class PaperExecutor(_BASE):
         # small delay possible (but not required)
         self._call_trader_open(side, executed_price, order["size"], fill_ts, fee)
 
+    # def _call_trader_open(self, side, price, size, ts, fee):
+    #     """Call trader open with fallback names."""
+    #     called = False
+    #     try:
+    #         if hasattr(self.trader, "open_position"):
+    #             self.trader.open_position(side, price)
+    #             called = True
+    #         elif hasattr(self.trader, "open"):
+    #             # many open() signatures exist; try basic safe call
+    #             try:
+    #                 self.trader.open(side, price)
+    #                 called = True
+    #             except TypeError:
+    #                 # fallback to alternate signature
+    #                 try:
+    #                     self.trader.open_position(side, price)
+    #                     called = True
+    #                 except Exception:
+    #                     pass
+    #     except Exception as e:
+    #         print("PaperExec OPEN error:", e)
+    #     if not called:
+    #         raise RuntimeError("Trader has no suitable open/open_position method")
+
+    # def _call_trader_close(self, price, reason, ts, fee):
+    #     """Call trader close with fallback names."""
+    #     called = False
+    #     try:
+    #         if hasattr(self.trader, "close_position"):
+    #             self.trader.close_position(price, reason)
+    #             called = True
+    #         elif hasattr(self.trader, "close"):
+    #             try:
+    #                 self.trader.close(price, reason)
+    #                 called = True
+    #             except TypeError:
+    #                 # fallback to older close_position signature attempt
+    #                 try:
+    #                     self.trader.close_position(price, reason)
+    #                     called = True
+    #                 except Exception:
+    #                     pass
+    #     except Exception as e:
+    #         print("PaperExec CLOSE error:", e)
+    #     if not called:
+    #         raise RuntimeError("Trader has no suitable close/close_position method")
+
     def _call_trader_open(self, side, price, size, ts, fee):
-        """Call trader open with fallback names."""
-        called = False
+        """Call TradeManager.open(side, price) cleanly."""
         try:
-            if hasattr(self.trader, "open_position"):
-                self.trader.open_position(side, price)
-                called = True
-            elif hasattr(self.trader, "open"):
-                # many open() signatures exist; try basic safe call
-                try:
-                    self.trader.open(side, price)
-                    called = True
-                except TypeError:
-                    # fallback to alternate signature
-                    try:
-                        self.trader.open_position(side, price)
-                        called = True
-                    except Exception:
-                        pass
+            self.trader.open(side, price,size)
         except Exception as e:
             print("PaperExec OPEN error:", e)
-        if not called:
-            raise RuntimeError("Trader has no suitable open/open_position method")
+            raise
 
     def _call_trader_close(self, price, reason, ts, fee):
-        """Call trader close with fallback names."""
-        called = False
+        """Call TradeManager.close(price, reason) cleanly."""
         try:
-            if hasattr(self.trader, "close_position"):
-                self.trader.close_position(price, reason)
-                called = True
-            elif hasattr(self.trader, "close"):
-                try:
-                    self.trader.close(price, reason)
-                    called = True
-                except TypeError:
-                    # fallback to older close_position signature attempt
-                    try:
-                        self.trader.close_position(price, reason)
-                        called = True
-                    except Exception:
-                        pass
+            self.trader.close(price, reason)
         except Exception as e:
             print("PaperExec CLOSE error:", e)
-        if not called:
-            raise RuntimeError("Trader has no suitable close/close_position method")
+            raise
+
 
     def _log_fill(self, order: dict, executed_price: float, fee: float, fill_ts: float):
         rec = {

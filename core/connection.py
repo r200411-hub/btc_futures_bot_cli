@@ -23,6 +23,8 @@ class DeltaExchangeWebSocket:
 
         self.last_reconnect = 0
         self.reconnect_attempts = 0
+        # optional list for debugging/tracking scheduled timers
+        self.timers = []
         self.reconnector = AdaptiveReconnect() if hasattr(__import__('core'), 'adaptive_reconnect') else None
 
         self.health_state = "OK"   # "OK" | "BAD"
@@ -244,6 +246,17 @@ class DeltaExchangeWebSocket:
                 except Exception:
                     pass
                 self._reconnect_timer = None
+
+         # cancel older timers (bookkeeping)
+            try:
+                    for tt in list(self.timers):
+                        try:
+                            tt.cancel()
+                        except:
+                            pass
+                    self.timers.clear()           
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -295,6 +308,11 @@ class DeltaExchangeWebSocket:
             t = threading.Timer(delay, lambda: self._do_reconnect(token))
             t.daemon = True
             self._reconnect_timer = t
+            # bookkeeping
+            try:
+                self.timers.append(t)
+            except Exception:
+                pass
             t.start()
 
     def _do_reconnect(self, token):

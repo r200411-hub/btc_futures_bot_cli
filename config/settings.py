@@ -3,7 +3,7 @@ settings = {
     "api_secret": "5KiQJMTDD9I6x8iM4EmfbtaTDdYs5yNaNY3NMuX8HoXH9AxMgd75J7wMEnrr",
 
     # Strategy core
-    "brick_size": 55,
+    "brick_size": 10,
     "fast_ema": 9,
     "slow_ema": 21,
 
