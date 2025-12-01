@@ -40,3 +40,10 @@ class FreezeDetector:
                 self.last_tick = time.time()
 
             time.sleep(3)
+    
+    def on_freeze(self):
+        if self.ws.health_state == "BAD":
+            return
+        self.ws.mark_dead()
+        self.ws.reconnect()
+
