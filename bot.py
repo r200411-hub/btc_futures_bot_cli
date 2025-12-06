@@ -1,4 +1,4 @@
-# bot.py  -- Full realistic paper trading integration (Option 1)
+# bot.py  -- Full realistic paper trading integration (Option C+ with Renko SL/TP + parquet fill & cooldown)
 import os
 import sys
 import time
@@ -45,35 +45,144 @@ executor.start()
 tick_filter = BadTickFilter(log_callback=lambda reason, price, pct=None: print(f"⚠ BAD TICK: {reason} {price} Δ={pct}"))
 
 # ---------------------------
-# Helpers: place_order -> executor
+# SL/TP policy: Renko-based defaults + override
+# ---------------------------
+_BRICK = float(settings.get("brick_size", 10.0))
+default_stop_loss = _BRICK * 1.0      # 1 brick
+default_take_profit = _BRICK * 2.0    # 2 bricks
+
+_user_sl = settings.get("stop_loss", None)
+_user_tp = settings.get("take_profit", None)
+
+if _user_sl is None or float(_user_sl) <= 0:
+    EFFECTIVE_SL = float(default_stop_loss)
+else:
+    EFFECTIVE_SL = float(_user_sl)
+
+if _user_tp is None or float(_user_tp) <= 0:
+    EFFECTIVE_TP = float(default_take_profit)
+else:
+    EFFECTIVE_TP = float(_user_tp)
+
+# cooldown after SL/TP close (seconds)
+SL_COOLDOWN = float(settings.get("sl_cooldown_s", 10.0))
+
+print(f"Using SL={EFFECTIVE_SL} TP={EFFECTIVE_TP} (brick={_BRICK}) cooldown={SL_COOLDOWN}s")
+
+# ---------------------------
+# Helpers, state for anti-reentry logic
+# ---------------------------
+# closed_due_to_sl stores timestamp of SL/TP close (None if none)
+closed_due_to_sl_ts = None
+closed_signal = None  # e.g. "LONG" or "SHORT"
+
+# convenience wrappers for safe logging
+def safe_log_csv(*args, **kwargs):
+    try:
+        logger_csv.log(*args, **kwargs)
+    except Exception as e:
+        print("LOGGER ERROR for CSV:", e)
+
+def safe_log_pq(row):
+    try:
+        logger_pq.log(row)
+    except Exception as e:
+        print("LOGGER ERROR for Parquet:", e)
+
+# ---------------------------
+# Order helpers
 # ---------------------------
 def place_order(side: str, price: float, size: float = None):
     """Submit an order to paper executor and print/return the outcome."""
+    global closed_due_to_sl_ts, closed_signal
     size = size or settings.get("position_size", 0.01)
-    res = executor.submit_order(side, size, price, meta={"source": "bot"})
-    if res.get("status") in ("queued",):
-        print(f"🟡 Order queued: {side} @ {price:.2f} size={size} (order_id={res.get('order_id')})")
+
+    # defensive normalization + validation
+    if side is None:
+        print(f"⚠ Refusing to place order: side is None for price={price}")
+        return {"status": "rejected", "reason": "invalid_side", "ts": time.time()}
+
+    side_norm = str(side).upper()
+    if side_norm not in ("LONG", "SHORT"):
+        print(f"⚠ Refusing to place order: invalid side='{side}' (normalized='{side_norm}') for price={price}")
+        return {"status": "rejected", "reason": "invalid_side", "ts": time.time()}
+
+    # Block re-entry if we closed recently due to SL/TP and cooldown hasn't expired
+    if closed_due_to_sl_ts is not None:
+        elapsed = time.time() - closed_due_to_sl_ts
+        if elapsed < SL_COOLDOWN and closed_signal == side_norm:
+            print(f"⚠ Blocking re-entry: recently closed on {closed_signal}, cooldown {SL_COOLDOWN:.1f}s not expired ({elapsed:.1f}s elapsed)")
+            return {"status": "rejected", "reason": "blocked_recent_sl_close_cooldown", "ts": time.time()}
+        # also block if same signal persists until a fresh crossover; that logic is handled elsewhere (signal change detection)
+
+    # If closed_due_to_sl_ts exists but cooldown passed, still respect the "fresh crossover" requirement:
+    # we only prevent immediate re-entry when the signal is identical and we haven't seen a new crossover.
+    # That is handled by the closed_signal variable cleared in on_price when signal changes.
+
+    res = executor.submit_order(side_norm, size, price, meta={"source": "bot"})
+    if res.get("status") == "queued":
+        print(f"🟡 Order queued: {side_norm} @ {price:.2f} size={size} (order_id={res.get('order_id')})")
+        # acting on a new order -> clear the SL-close block so we can trade again after this order resolves
+        closed_due_to_sl_ts = None
+        closed_signal = None
     else:
-        # rejected or immediate response
         print(f"🔴 Order status: {res}")
     return res
 
-def close_position_by_executor(price: float):
+def _write_parquet_fill_row(price, side, pnl=0.0):
+    """Write a minimal parquet fill event for analysis."""
+    try:
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "price": price,
+            "fast_ema": strategy.fast[-1] if strategy.fast else None,
+            "slow_ema": strategy.slow[-1] if strategy.slow else None,
+            "fast_period": getattr(strategy, "fast_period", None),
+            "slow_period": getattr(strategy, "slow_period", None),
+            "ema_spread": (strategy.fast[-1] - strategy.slow[-1]) if (strategy.fast and strategy.slow) else None,
+            "vol_ema": getattr(strategy, "vol", None),
+            "regime": "FILL",
+            "regime_confidence": 0.0,
+            "brick_dir": strategy.bricks[-1]["dir"] if strategy.bricks else None,
+            "brick_count": len(strategy.bricks),
+            "signal": None,
+            "pos_side": side,
+            "pnl": float(pnl)
+        }
+        safe_log_pq(row)
+    except Exception as e:
+        print("⚠ parquet fill logging failed:", e)
+
+def close_only_position(price: float, reason: str = "MANUAL_CLOSE"):
     """
-    Close existing position by submitting opposite-side order.
-    PaperExecutor's worker will handle close logic (it closes if existing side differs).
+    Close current position immediately via TradeManager.close (do not open opposite).
+    Also write a parquet fill row and set SL-close cooldown and block-signal.
     """
+    global closed_due_to_sl_ts, closed_signal
     if not getattr(trader, "position", None):
         print("⚪ No open position to close.")
         return
-    # Correct: read actual side
-    cur_side = trader.position.get("side") or trader.position.get("type")
-    if not cur_side:
-        print("⚠ trader.position has no side/type key!")
-        return
-    opposite = "SHORT" if cur_side == "LONG" else "LONG"
-    place_order(opposite, price, size=trader.position.get("size", settings.get("position_size")))
+    pos = trader.position or {}
+    side = pos.get("side") or pos.get("type") or None
 
+    # attempt to compute PnL for logging (best-effort)
+    try:
+        pnl = trader.calculate_pnl(price) if getattr(trader, "position", None) else 0.0
+    except Exception:
+        pnl = 0.0
+
+    try:
+        trader.close(price, reason)
+        print(f"📉 CLOSE {side} @ {price} PnL={pnl:.2f} TOTAL={getattr(trader, 'total', 0.0):.2f} ({reason})")
+    except Exception as e:
+        print("⚠ direct close failed:", e)
+        # fallback: attempt executor-based close (but that may re-open; we avoid that)
+    # write a parquet fill row marking the close
+    _write_parquet_fill_row(price, side, pnl=pnl)
+
+    # mark closed_by_sl timestamp and side (block re-entry for cooldown)
+    closed_due_to_sl_ts = time.time()
+    closed_signal = side
 
 # ---------------------------
 # periodic auto-flush for parquet logger
@@ -136,7 +245,6 @@ def shutdown(signum=None, frame=None):
     # small sleep to let final flushes happen
     time.sleep(0.25)
     print("Goodbye.")
-    # use os._exit here to avoid blocking if threads remain (clean)
     os._exit(0)
 
 signal.signal(signal.SIGINT, shutdown)
@@ -148,13 +256,9 @@ signal.signal(signal.SIGTERM, shutdown)
 def on_price(price, raw=None):
     """
     Main tick callback.
-    - validate tick
-    - update strategy
-    - update regime
-    - log ML row
-    - decide signals
-    - submit orders to PaperExecutor (executor handles fills)
     """
+    global closed_due_to_sl_ts, closed_signal
+
     try:
         price = float(price)
     except Exception:
@@ -190,77 +294,65 @@ def on_price(price, raw=None):
 
     # generate signal (renko + ema crossover)
     sig = strategy.signal()
+    brick_dir = strategy.bricks[-1]["dir"] if strategy.bricks else None
 
     # debug print
-    print(f"tick {price:.2f} | regime={current_regime} | signal={sig}")
+    print(f"tick {price:.2f} | signal={sig} | brick_dir={brick_dir}")
 
-    # Log ML row (CSV + Parquet)
-    try:
-        logger_csv.log(price, strategy, trader, regime, sig)
-    except Exception as e:
-        print("LOGGER ERROR for CSV:", e)
+    # Log everything safely
+    safe_log_csv(price, strategy, trader, regime, sig)
+    safe_log_pq({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "price": price,
+        "fast_ema": strategy.fast[-1] if strategy.fast else None,
+        "slow_ema": strategy.slow[-1] if strategy.slow else None,
+        "fast_period": strategy.fast_period,
+        "slow_period": strategy.slow_period,
+        "ema_spread": (strategy.fast[-1] - strategy.slow[-1]) if (strategy.fast and strategy.slow) else None,
+        "vol_ema": strategy.vol,
+        "regime": regime.current_regime,
+        "regime_confidence": getattr(regime, "confidence", getattr(regime,"last_spread",0.0)),
+        "brick_dir": brick_dir,
+        "brick_count": len(strategy.bricks),
+        "signal": sig,
+        "pos_side": trader.position.get("side") if trader.position else None,
+        "pnl": trader.calculate_pnl(price) if getattr(trader, "position", None) else 0.0
+    })
 
-    try:
-        logger_pq.log({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "price": price,
-            "fast_ema": strategy.fast[-1] if strategy.fast else None,
-            "slow_ema": strategy.slow[-1] if strategy.slow else None,
-            "fast_period": getattr(strategy, "fast_period", None),
-            "slow_period": getattr(strategy, "slow_period", None),
-            "ema_spread": (strategy.fast[-1] - strategy.slow[-1]) if (strategy.fast and strategy.slow) else None,
-            "vol_ema": getattr(strategy, "vol", None),
-            "regime": regime.current_regime,
-            "regime_confidence": getattr(regime, "confidence", getattr(regime, "last_spread", 0.0)),
-            "brick_dir": strategy.bricks[-1]["dir"] if strategy.bricks else None,
-            "brick_count": len(strategy.bricks),
-            "signal": sig,
-            "pos_side": trader.position.get("side") if trader.position else None,
-            "pnl": trader.calculate_pnl(price) if getattr(trader, "position", None) else 0.0
-        })
-    except Exception as e:
-        print("LOGGER ERROR for Parquet:", e)
+    # ---- FILTERED PURE TRADING (Option C+) ----
+    if sig == "LONG" and brick_dir == "up":
+        place_order("LONG", price)
+    elif sig == "SHORT" and brick_dir == "down":
+        place_order("SHORT", price)
 
-    # Regime-aware execution: submit to executor (paper)
-    if sig:
-        # block if regime says no
-        if sig == "LONG" and not regime.can_trade_long():
-            print(f"⛔ LONG blocked by regime: {regime.current_regime}")
-        elif sig == "SHORT" and not regime.can_trade_short():
-            print(f"⛔ SHORT blocked by regime: {regime.current_regime}")
-        elif regime.is_danger():
-            print(f"⛔ Trade blocked (danger regime: {regime.current_regime})")
-        else:
-            # place order via executor (submission only)
-            place_order(sig, price)
-
-    # Manage active position: check SL/TP via PnL and close by submitting opposite-side order
+    # Manage active position: check SL/TP via PnL and close (close-only: DO NOT reverse)
     if getattr(trader, "position", None):
         pnl = trader.calculate_pnl(price)
-        # print PnL inline
         print(f"PnL: {pnl:.2f}", end="\r")
 
-        # check stoploss/takeprofit from settings
-        if pnl >= settings.get("take_profit") or pnl <= -abs(settings.get("stop_loss")):
-            print("\n🏁 SL/TP triggered — closing position via executor")
-            # close by submitting opposite-side (executor will close existing position)
-            close_position_by_executor(price)
-            # small delay to let executor apply fill
+        if pnl >= EFFECTIVE_TP or pnl <= -abs(EFFECTIVE_SL):
+            print("\n🏁 SL/TP triggered — closing position (close-only, no reversal)")
+            close_only_position(price, reason="SL/TP")
             time.sleep(0.05)
-            # log after close
             try:
                 logger_csv.log(price, strategy, trader, regime, None)
-            except:
+            except Exception:
                 pass
+
+    # Clear closed_due_to_sl if signal changed (we allow re-entry only after a fresh crossover)
+    if closed_due_to_sl_ts is not None:
+        # if cooldown expired, also allow re-entry (but still require signal change check below)
+        cooldown_passed = (time.time() - closed_due_to_sl_ts) >= SL_COOLDOWN
+        if sig is None or (closed_signal is not None and sig != closed_signal) or cooldown_passed:
+            print("🔓 SL-close condition cleared (either signal changed or cooldown expired) — re-entry allowed now.")
+            closed_due_to_sl_ts = None
+            closed_signal = None
 
 # ---------------------------
 # Create WS and attach guards
 # ---------------------------
-
-# make WS object
 ws = DeltaExchangeWebSocket(settings["api_key"], settings["api_secret"], on_price)
 
-# Guards: hang, heartbeat, freeze, slowdown
 hang = SilentHangGuard(timeout=10, on_hang=lambda: ws.reconnect())
 hang.start()
 ws.hang = hang
@@ -281,7 +373,7 @@ slow.start()
 risk = RiskGuard(
     max_exposure_seconds=settings.get("max_exposure_seconds", 180),
     max_distance_pct=settings.get("max_distance_pct", 0.4),
-    on_risk=lambda reason: close_position_by_executor(strategy.last_price if hasattr(strategy, "last_price") else None)
+    on_risk=lambda reason: close_only_position(strategy.last_price if hasattr(strategy, "last_price") else None)
 )
 
 # start auto-flush

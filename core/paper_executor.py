@@ -5,20 +5,17 @@ import random
 from queue import Queue, Empty
 from typing import Optional, Dict
 
-# If you have an ExecutorBase, keep it - otherwise remove the import and
-# change the class signature to `class PaperExecutor:`
 try:
     from core.executor_base import ExecutorBase
     _BASE = ExecutorBase
 except Exception:
-    _BASE = object  # fallback if ExecutorBase not present
+    _BASE = object
 
 
 class PaperExecutor(_BASE):
     """
-    Realistic paper trading executor (background worker).
-    - submit_order(side, size, price) -> queued fill simulation
-    - start()/stop() to run worker thread
+    Paper executor: queue orders and apply fills to TradeManager.
+    Expects TradeManager.open(side, price, size) and TradeManager.close(price, reason).
     """
 
     def __init__(self, settings: dict, trader, csv_logger=None, pq_logger=None):
@@ -31,28 +28,34 @@ class PaperExecutor(_BASE):
         self.worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
 
-        # runtime params
         self.last_fill_ts = 0.0
-        self.min_trade_gap_s = float(settings.get("min_trade_gap_s",
-                                                 settings.get("min_trade_gap", 1.0)))
-        self.sim_spread_usd = float(settings.get("sim_spread_usd", 1.0))
-        self.sim_slippage_pct = float(settings.get("sim_slippage_pct", 0.0005))
-        self.sim_latency_ms = float(settings.get("sim_latency_ms", 20))
-        self.sim_random_slippage = bool(settings.get("sim_random_slippage", True))
-        self.fee_taker_pct = float(settings.get("fee_taker_pct", 0.0005))
-        self.fee_maker_pct = float(settings.get("fee_maker_pct", 0.0002))
-        self.enable_trailing = bool(settings.get("enable_trailing", False))
-        self.trailing_pts = float(settings.get("trailing_pts", 0.0))
-        self.fill_probability = float(settings.get("sim_fill_prob", 0.995))
+        self.min_trade_gap_s = float(self.settings.get("min_trade_gap_s", self.settings.get("min_trade_gap", 0.5)))
+        self.sim_spread_usd = float(self.settings.get("sim_spread_usd", 1.0))
+        self.sim_slippage_pct = float(self.settings.get("sim_slippage_pct", 0.0005))
+        self.sim_latency_ms = float(self.settings.get("sim_latency_ms", 20))
+        self.sim_random_slippage = bool(self.settings.get("sim_random_slippage", True))
+        self.fee_taker_pct = float(self.settings.get("fee_taker_pct", 0.0005))
+        self.fill_probability = float(self.settings.get("sim_fill_prob", 0.995))
 
-        # outstanding simulated orders
-        self.outstanding: Dict[str, Dict] = {}
         self.order_id_ctr = 0
         self.lock = threading.Lock()
 
-    # -------------------------
-    # Public API
-    # -------------------------
+        # Outstanding orders (required for cancel_all)
+        self.outstanding: Dict[str, Dict] = {}
+
+    # ---------------------------------------------------------------------
+    # Required abstract method override
+    # ---------------------------------------------------------------------
+    def cancel_all(self):
+        """
+        Cancel all outstanding simulated orders (required by ExecutorBase).
+        """
+        with self.lock:
+            n = len(self.outstanding)
+            self.outstanding.clear()
+        return n
+
+    # ---------------------------------------------------------------------
     def start(self):
         if self.worker and self.worker.is_alive():
             return
@@ -65,61 +68,111 @@ class PaperExecutor(_BASE):
         if self.worker:
             self.worker.join(timeout=timeout)
 
-    def submit_order(self, side: str, size: float, price: float, meta: dict = None) -> dict:
-        """
-        Submit an order to the paper executor.
+    def _next_oid(self):
+        with self.lock:
+            self.order_id_ctr += 1
+            return f"paper-{self.order_id_ctr}"
 
-        Returns a lightweight result dict. If queued, status='queued'.
-        If rejected because of min_gap, returns status='rejected'.
-        """
+    def submit_order(self, side: str, size: float, price: float, meta: dict = None) -> dict:
         now = time.time()
-        # Enforce min trade gap (between fills)
+        if side is None:
+            return {"status": "rejected", "reason": "invalid_side_none", "ts": now}
+
+        side_norm = str(side).upper()
+        if side_norm not in ("LONG", "SHORT"):
+            return {"status": "rejected", "reason": f"invalid_side_{side_norm}", "ts": now}
+
         if now - self.last_fill_ts < self.min_trade_gap_s:
             return {"status": "rejected", "reason": "min_trade_gap", "ts": now}
 
         order = {
             "order_id": self._next_oid(),
-            "side": str(side).upper(),
+            "side": side_norm,
             "size": float(size),
             "submitted_price": float(price),
             "meta": meta or {},
             "submitted_at": now,
         }
 
+        with self.lock:
+            self.outstanding[order["order_id"]] = order
+
         self.queue.put(order)
         return {"status": "queued", "order_id": order["order_id"], "ts": now}
 
-    def cancel_all(self):
-        with self.lock:
-            n = len(self.outstanding)
-            self.outstanding.clear()
-        return n
+    # ---------------------------------------------------------------------
+    def _compute_executed_price(self, order):
+        p = float(order["submitted_price"])
+        half_spread = self.sim_spread_usd / 2.0
+        sign = 1.0 if order["side"] == "LONG" else -1.0
+        base_slip = self.sim_slippage_pct * p
+        slip = random.gauss(base_slip, base_slip * 0.5) if self.sim_random_slippage else base_slip
+        executed = p + sign * (half_spread + slip)
+        return float(round(executed, 8))
 
-    # -------------------------
-    # Internal helpers
-    # -------------------------
-    def _next_oid(self) -> str:
-        with self.lock:
-            self.order_id_ctr += 1
-            return f"paper-{self.order_id_ctr}"
+    # ---------------------------------------------------------------------
+    def _apply_fill_to_trader(self, order, executed_price, fee, fill_ts):
+        pos = getattr(self.trader, "position", None) or {}
+        cur_side = pos.get("side") or pos.get("type")
 
+        # open new position if none
+        if not cur_side:
+            try:
+                self.trader.open(order["side"], executed_price, order["size"])
+            except TypeError:
+                self.trader.open(order["side"], executed_price)
+            return
+
+        # same side → ignore
+        if cur_side.upper() == order["side"].upper():
+            return
+
+        # opposite → close then open
+        self.trader.close(executed_price, "EXECUTE_REPLACE")
+        try:
+            self.trader.open(order["side"], executed_price, order["size"])
+        except TypeError:
+            self.trader.open(order["side"], executed_price)
+
+    # ---------------------------------------------------------------------
+    def _log_fill(self, order, executed_price, fee, fill_ts):
+        if not self.pq_logger:
+            return
+        row = {
+            "timestamp": datetime_iso(fill_ts),
+            "price": executed_price,
+            "fast_ema": None,
+            "slow_ema": None,
+            "fast_period": None,
+            "slow_period": None,
+            "ema_spread": None,
+            "vol_ema": None,
+            "regime": "FILL",
+            "regime_confidence": 0.0,
+            "brick_dir": None,
+            "brick_count": 0,
+            "signal": None,
+            "pos_side": order["side"],
+            "pnl": 0.0
+        }
+        try:
+            self.pq_logger.log(row)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------------
     def _run(self):
-        """
-        Worker loop: takes queued orders, simulates latency, fill probability,
-        computes executed price (spread+slippage), then calls the trader to open/close
-        and logs the fill (best-effort).
-        """
         while not self.stop_event.is_set():
             try:
                 order = self.queue.get(timeout=0.5)
             except Empty:
                 continue
 
-            # simulate latency
+            # latency
             latency = max(0.0, random.gauss(self.sim_latency_ms, max(1.0, self.sim_latency_ms * 0.25)) / 1000.0)
             time.sleep(latency)
 
-            # occasionally simulate no-fill
+            # random no-fill simulation
             if random.random() > self.fill_probability:
                 continue
 
@@ -127,175 +180,16 @@ class PaperExecutor(_BASE):
             fee = executed_price * order["size"] * self.fee_taker_pct
             fill_ts = time.time()
 
-            # update last_fill_ts atomically
             with self.lock:
                 self.last_fill_ts = fill_ts
+                self.outstanding.pop(order["order_id"], None)
 
-            # apply to trader
-            try:
-                self._apply_fill_to_trader(order, executed_price, fee, fill_ts)
-            except Exception as e:
-                print("PaperExecutor: failed to apply fill:", e)
-
-            # log fill best-effort
-            try:
-                self._log_fill(order, executed_price, fee, fill_ts)
-            except Exception:
-                pass
-
-        # worker stopping -> exit
-        return
-
-    def _compute_executed_price(self, order: dict) -> float:
-        side = order["side"]
-        p = float(order["submitted_price"])
-        half_spread = self.sim_spread_usd / 2.0
-        sign = 1.0 if side == "LONG" else -1.0
-        base_slip = self.sim_slippage_pct * p
-        if self.sim_random_slippage:
-            slip = random.gauss(base_slip, base_slip * 0.5)
-        else:
-            slip = base_slip
-        executed = p + sign * (half_spread + slip)
-        return float(round(executed, 8))
-
-    def _apply_fill_to_trader(self, order: dict, executed_price: float, fee: float, fill_ts: float):
-        """
-        Applies the simulated fill to the trader:
-         - if no open position -> open
-         - if open same side -> ignore (or could add)
-         - if open opposite side -> close existing then open new
-        Assumes the trader exposes either .open(side, price) and .close(price, reason)
-        (older API) or .open_position/.close_position variants — fallback used.
-        """
-        side = order["side"]
-        # current side: try common keys 'type' or 'side'
-        cur_side = None
-        if getattr(self.trader, "position", None):
-            cur_side = (self.trader.position.get("type")
-                        or self.trader.position.get("side")
-                        or self.trader.position.get("position_side"))
-
-        # no position -> open
-        if not cur_side:
-            self._call_trader_open(side, executed_price, order["size"], fill_ts, fee)
-            return
-
-        # same side -> ignore (simple behavior)
-        if cur_side and cur_side.upper() == side.upper():
-            # Already in same side; not increasing or scaling in current simple model
-            return
-
-        # opposite side -> close then open
-        self._call_trader_close(executed_price, "EXECUTE_REPLACE", fill_ts, fee)
-        # small delay possible (but not required)
-        self._call_trader_open(side, executed_price, order["size"], fill_ts, fee)
-
-    # def _call_trader_open(self, side, price, size, ts, fee):
-    #     """Call trader open with fallback names."""
-    #     called = False
-    #     try:
-    #         if hasattr(self.trader, "open_position"):
-    #             self.trader.open_position(side, price)
-    #             called = True
-    #         elif hasattr(self.trader, "open"):
-    #             # many open() signatures exist; try basic safe call
-    #             try:
-    #                 self.trader.open(side, price)
-    #                 called = True
-    #             except TypeError:
-    #                 # fallback to alternate signature
-    #                 try:
-    #                     self.trader.open_position(side, price)
-    #                     called = True
-    #                 except Exception:
-    #                     pass
-    #     except Exception as e:
-    #         print("PaperExec OPEN error:", e)
-    #     if not called:
-    #         raise RuntimeError("Trader has no suitable open/open_position method")
-
-    # def _call_trader_close(self, price, reason, ts, fee):
-    #     """Call trader close with fallback names."""
-    #     called = False
-    #     try:
-    #         if hasattr(self.trader, "close_position"):
-    #             self.trader.close_position(price, reason)
-    #             called = True
-    #         elif hasattr(self.trader, "close"):
-    #             try:
-    #                 self.trader.close(price, reason)
-    #                 called = True
-    #             except TypeError:
-    #                 # fallback to older close_position signature attempt
-    #                 try:
-    #                     self.trader.close_position(price, reason)
-    #                     called = True
-    #                 except Exception:
-    #                     pass
-    #     except Exception as e:
-    #         print("PaperExec CLOSE error:", e)
-    #     if not called:
-    #         raise RuntimeError("Trader has no suitable close/close_position method")
-
-    def _call_trader_open(self, side, price, size, ts, fee):
-        """Call TradeManager.open(side, price) cleanly."""
-        try:
-            self.trader.open(side, price,size)
-        except Exception as e:
-            print("PaperExec OPEN error:", e)
-            raise
-
-    def _call_trader_close(self, price, reason, ts, fee):
-        """Call TradeManager.close(price, reason) cleanly."""
-        try:
-            self.trader.close(price, reason)
-        except Exception as e:
-            print("PaperExec CLOSE error:", e)
-            raise
+            self._apply_fill_to_trader(order, executed_price, fee, fill_ts)
+            self._log_fill(order, executed_price, fee, fill_ts)
 
 
-    def _log_fill(self, order: dict, executed_price: float, fee: float, fill_ts: float):
-        rec = {
-            "timestamp": fill_ts,
-            "side": order["side"],
-            "order_id": order["order_id"],
-            "submitted_price": order["submitted_price"],
-            "executed_price": executed_price,
-            "size": order["size"],
-            "fee": fee
-        }
-        # attempt csv logger (best-effort)
-        try:
-            if self.csv_logger and hasattr(self.csv_logger, "w"):
-                # if csv_logger has a writer, you can implement a small fill row writer here
-                pass
-        except Exception:
-            pass
-
-        # attempt parquet logger with a small fill event
-        try:
-            if self.pq_logger and hasattr(self.pq_logger, "log"):
-                row = {
-                    "timestamp": fill_ts,
-                    "price": executed_price,
-                    "fast_ema": None,
-                    "slow_ema": None,
-                    "fast_period": None,
-                    "slow_period": None,
-                    "ema_spread": None,
-                    "vol_ema": None,
-                    "regime": "FILL",
-                    "regime_confidence": 0.0,
-                    "brick_dir": None,
-                    "brick_count": 0,
-                    "signal": None,
-                    "pos_side": order["side"],
-                    "pnl": 0.0
-                }
-                try:
-                    self.pq_logger.log(row)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+def datetime_iso(ts=None):
+    import datetime
+    if ts is None:
+        ts = time.time()
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat()

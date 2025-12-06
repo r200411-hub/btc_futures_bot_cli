@@ -3,7 +3,7 @@ settings = {
     "api_secret": "5KiQJMTDD9I6x8iM4EmfbtaTDdYs5yNaNY3NMuX8HoXH9AxMgd75J7wMEnrr",
 
     # Strategy core
-    "brick_size": 10,
+    "brick_size": 80,
     "fast_ema": 9,
     "slow_ema": 21,
 
@@ -13,9 +13,10 @@ settings = {
 
     # Risk
     "take_profit": 4.0,
-    "stop_loss": 2.0,
+    "stop_loss": 4.0,
+    "sl_cooldown_s":5,
     "max_exposure_seconds": 180,
-
+    
     # Dynamic EMA
     "vol_low": 10.0,
     "vol_high": 60.0,
